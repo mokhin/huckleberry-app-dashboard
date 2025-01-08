@@ -22,7 +22,7 @@ st.set_page_config(
 # Constants
 CONSTANT_DATE = datetime(1, 1, 1)
 RAW_EXAMPLE_CSV_FILE = "data/example.csv"
-NIGHT_START_HOUR = 20
+NIGHT_START_HOUR = 18
 NIGHT_END_HOUR = 6
 DATE_FORMAT = "%Y-%m-%d %H:%M"
 
@@ -41,7 +41,7 @@ def set_constant_date(dt: datetime) -> datetime:
 
 
 # Function to load and process data
-@st.cache_data
+# @st.cache_data
 def load_and_process_data(file_path: str) -> pl.DataFrame:
     try:
         df = (
@@ -51,15 +51,33 @@ def load_and_process_data(file_path: str) -> pl.DataFrame:
                 pl.col("End").str.to_datetime(DATE_FORMAT),
             )
             .with_columns(
+                pl.datetime(
+                    pl.col("Start").dt.year(),
+                    pl.col("Start").dt.month(),
+                    pl.col("Start").dt.day(),
+                    NIGHT_START_HOUR,
+                    0,
+                    0,
+                ).alias("NightStart"),
+            )
+            .with_columns(
                 pl.col("Start").dt.date().alias("StartDate"),
                 pl.col("End").dt.date().alias("EndDate"),
             )
             .with_columns((pl.col("End") - pl.col("Start")).alias("Duration"))
             .with_columns(
-                pl.col("Start").map_elements(
-                    set_constant_date, return_dtype=pl.Datetime
-                ),
-                pl.col("End").map_elements(set_constant_date, return_dtype=pl.Datetime),
+                pl.col("Start")
+                .map_elements(set_constant_date, return_dtype=pl.Datetime)
+                .alias("StartTime"),
+                pl.col("End")
+                .map_elements(set_constant_date, return_dtype=pl.Datetime)
+                .alias("EndTime"),
+            )
+            # Add NightStart timestamp - take StartDate and add NIGHT_START_HOUR
+            .with_columns(
+                (pl.col("Start") + (pl.col("End") - pl.col("Start")) / 2).alias(
+                    "MiddlePoint"
+                )
             )
             .filter(pl.col("StartDate") > pl.col("StartDate").min())
             .filter(
@@ -75,14 +93,159 @@ def load_and_process_data(file_path: str) -> pl.DataFrame:
     # Add day/night column
     df = df.with_columns(
         pl.when(
-            (pl.col("Start").dt.hour() >= NIGHT_START_HOUR)
-            | (pl.col("Start").dt.hour() < NIGHT_END_HOUR)
+            (pl.col("MiddlePoint").dt.hour() >= NIGHT_START_HOUR)
+            | (pl.col("MiddlePoint").dt.hour() < NIGHT_END_HOUR)
         )
         .then(pl.lit("Night"))
         .otherwise(pl.lit("Day"))
         .alias("DayOrNight"),
     )
+
+    # Add NightDay column if StartTime between 18:00 and 00:00 then = StartDate, else = StartDate + 1
+    df = df.with_columns(
+        pl.when(pl.col("StartTime").dt.hour() >= NIGHT_START_HOUR)
+        .then(pl.col("StartDate"))
+        .otherwise(pl.col("StartDate") + pl.duration(days=1))
+        .alias("NightDay"),
+    )
+
     return df
+
+
+def create_data_for_gantt(df: pl.DataFrame) -> pl.DataFrame:
+    constant_date = datetime(1, 1, 1)
+
+    one_day_df = df.filter(pl.col("StartDate") == pl.col("EndDate")).with_columns(
+        pl.col("StartDate").alias("Date")
+    )
+    two_days_df = df.filter(pl.col("StartDate") != pl.col("EndDate"))
+
+    two_days_part_1_df = two_days_df.with_columns(
+        pl.lit(
+            datetime(
+                constant_date.year,
+                constant_date.month,
+                constant_date.day,
+                23,
+                59,
+                59,
+                0,
+            )
+        ).alias("EndTime"),
+        pl.col("StartDate").alias("Date"),
+    )
+
+    two_days_part_2_df = two_days_df.with_columns(
+        pl.lit(
+            datetime(
+                constant_date.year, constant_date.month, constant_date.day, 0, 0, 0, 0
+            )
+        ).alias("StartTime"),
+        pl.col("EndDate").alias("Date"),
+    )
+
+    return pl.concat([one_day_df, two_days_part_1_df, two_days_part_2_df]).select(
+        ["Type", "StartTime", "EndTime", "Date"]
+    )
+
+
+# Calculate StartNights with the longest average sleep duration
+def create_best_days_df(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.filter(pl.col("Type") == "Sleep")
+        .filter(pl.col("DayOrNight") == "Night")
+        .group_by("NightDay")
+        .agg(pl.col("Duration").mean())
+        .sort("Duration", descending=True, nulls_last=True)
+        .select(["NightDay", "Duration"])
+        .rename({"NightDay": "Date"})
+        .head(10)
+    )
+
+
+def create_worst_days_df(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.filter(pl.col("Type") == "Sleep")
+        .filter(pl.col("DayOrNight") == "Night")
+        .group_by("NightDay")
+        .agg(pl.col("Duration").mean())
+        .sort("Duration", nulls_last=True)
+        .select(["NightDay", "Duration"])
+        .rename({"NightDay": "Date"})
+        .head(10)
+    )
+
+
+def create_worst_days_stat_df(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.filter(pl.col("Type") == "Sleep")
+        .filter(pl.col("DayOrNight") == "Day")
+        .group_by("StartDate")
+        .agg(
+            # Col1
+            pl.col("Duration")
+            .sum()
+            .cast(pl.Float64)
+            .mul(1 / (60 * 60 * 1e6))
+            .round(1)
+            .alias("Day Sleep Hours"),
+            # Col2
+            pl.col("Duration").len().alias("Day Naps"),
+            # Col3
+            pl.col("Duration")
+            .mean()
+            .cast(pl.Float64)
+            .mul(1 / (60 * 60 * 1e6))
+            .round(1)
+            .alias("Hours per Nap"),
+        )
+        .rename({"StartDate": "Date"})
+        .join(
+            worst_days_df.with_columns(
+                pl.col("Duration").cast(pl.Float32).mul(1 / (60 * 60 * 1e6)).round(2)
+            ).rename({"Duration": "Next Day Average Sleep Duration"}),
+            on="Date",
+            how="inner",
+        )
+        .with_columns(pl.col("Date").cast(pl.String))
+        .sort(["Date"], nulls_last=True)
+    )
+
+
+def create_best_days_stat_df(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.filter(pl.col("Type") == "Sleep")
+        .filter(pl.col("DayOrNight") == "Day")
+        .group_by("StartDate")
+        .agg(
+            # Col1
+            pl.col("Duration")
+            .sum()
+            .cast(pl.Float64)
+            .mul(1 / (60 * 60 * 1e6))
+            .round(1)
+            .alias("Day Sleep Hours"),
+            # Col2
+            pl.col("Duration").len().alias("Day Naps"),
+            # Col3
+            pl.col("Duration")
+            .mean()
+            .cast(pl.Float64)
+            .mul(1 / (60 * 60 * 1e6))
+            .round(1)
+            .alias("Hours per Nap"),
+        )
+        .rename({"StartDate": "Date"})
+        .join(
+            best_days_df.with_columns(
+                pl.col("Duration").cast(pl.Float32).mul(1 / (60 * 60 * 1e6)).round(2)
+            ).rename({"Duration": "Next Night Average Sleep Duration"}),
+            on="Date",
+            how="inner",
+        )
+        .with_columns(pl.col("Date").cast(pl.String))
+        .sort(["Date"], nulls_last=True)
+    )
 
 
 # Dashboard
@@ -114,6 +277,7 @@ col1, col2, col3, col4 = st.columns(4)
 
 # Filter data
 df = df.filter(pl.col("StartDate") >= start_date)
+
 growth_df = (
     df.filter(pl.col("Type") == "Growth")
     .rename(
@@ -129,17 +293,21 @@ growth_df = (
     .select(["StartDate", "Weight", "Height", "HeadCircumference"])
 )
 
+gantt_df = create_data_for_gantt(df)
+
 col1.metric(
     label="Sleep hours per day",
     value=(
-        round(
-            df.filter(pl.col("Type") == "Sleep")
-            .group_by("StartDate")
-            .agg(pl.col("Duration").sum().cast(pl.Float64).mul(1 / (60 * 60 * 1e6)))
-            .select("Duration")
-            .mean()
-            .item(),
-            1,
+        int(
+            round(
+                df.filter(pl.col("Type") == "Sleep")
+                .group_by("StartDate")
+                .agg(pl.col("Duration").sum().cast(pl.Float64).mul(1 / (60 * 60 * 1e6)))
+                .select("Duration")
+                .mean()
+                .item(),
+                0,
+            )
         )
     ),
 )
@@ -147,14 +315,16 @@ col1.metric(
 col2.metric(
     label="Sleeps per day",
     value=(
-        round(
-            df.filter(pl.col("Type") == "Sleep")
-            .group_by("StartDate")
-            .len()
-            .select("len")
-            .mean()
-            .item(),
-            1,
+        int(
+            round(
+                df.filter(pl.col("Type") == "Sleep")
+                .group_by("StartDate")
+                .len()
+                .select("len")
+                .mean()
+                .item(),
+                0,
+            )
         )
     ),
 )
@@ -162,23 +332,25 @@ col2.metric(
 col3.metric(
     label="% of night sleep hours",
     value=(
-        round(
-            df.filter(pl.col("Type") == "Sleep")
-            .group_by("StartDate")
-            .agg(
-                (
+        int(
+            round(
+                df.filter(pl.col("Type") == "Sleep")
+                .group_by("StartDate")
+                .agg(
                     (
-                        pl.col("Duration")
-                        * (pl.col("DayOrNight") == "Night").cast(pl.Float64)
-                    ).sum()
-                    / pl.col("Duration").sum()
-                ).alias("ShareOfNightSleeps")
+                        (
+                            pl.col("Duration")
+                            * (pl.col("DayOrNight") == "Night").cast(pl.Float64)
+                        ).sum()
+                        / pl.col("Duration").sum()
+                    ).alias("ShareOfNightSleeps")
+                )
+                .select("ShareOfNightSleeps")
+                .mean()
+                .item()
+                * 100,
+                0,
             )
-            .select("ShareOfNightSleeps")
-            .mean()
-            .item()
-            * 100,
-            1,
         )
     ),
 )
@@ -186,16 +358,16 @@ col3.metric(
 col4.metric(
     label="Feeds per day",
     value=(
-        round(
-            df.filter(pl.col("StartDate") > df.select("StartDate").min().item())
-            .filter(pl.col("StartDate") < df.select("StartDate").max().item())
-            .filter(pl.col("Type") == "Feed")
-            .group_by("StartDate")
-            .len()
-            .select("len")
-            .mean()
-            .item(),
-            1,
+        int(
+            round(
+                df.filter(pl.col("Type") == "Feed")
+                .group_by("StartDate")
+                .len()
+                .select("len")
+                .mean()
+                .item(),
+                0,
+            )
         )
     ),
 )
@@ -222,8 +394,7 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
 
@@ -253,8 +424,7 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
 
@@ -291,8 +461,7 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
 
@@ -314,8 +483,7 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
 
@@ -337,8 +505,7 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
 
@@ -358,8 +525,7 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
 
@@ -379,7 +545,78 @@ st.altair_chart(
         titleAngle=0,
         titleY=-10,
         titleX=-22,
-    )
-    .interactive(bind_y=False),
+    ),
     use_container_width=True,
 )
+
+st.markdown("## Best days")
+st.markdown("### Top 10 longest average next night sleep duration")
+
+best_days_df = create_best_days_df(df)
+best_days_stat_df = create_best_days_stat_df(df)
+
+# Plot 8
+# Gantt chart
+st.altair_chart(
+    alt.Chart(
+        data=gantt_df.filter(pl.col("Type") == "Sleep")
+        .join(best_days_df, on="Date", how="inner")
+        .with_columns(pl.col("Date").cast(pl.String)),
+    )
+    .mark_bar()
+    .encode(
+        x=alt.X(
+            "StartTime:T",
+            title="",
+            axis=alt.Axis(format="%H:%M"),
+        ),
+        x2="EndTime:T",
+        y=alt.Y("Date", title=""),
+        color=alt.Color("Type", legend=alt.Legend(orient="top", title=None)),
+    )
+    .configure_axisY(
+        titleAngle=0,
+        titleY=-10,
+        titleX=-22,
+    ),
+    use_container_width=True,
+)
+
+st.write(best_days_stat_df)
+
+st.markdown("## Worst days")
+st.markdown("### Top 10 shortest average next night sleep duration")
+
+
+worst_days_df = create_worst_days_df(df)
+worst_days_stat_df = create_worst_days_stat_df(df)
+
+
+# Plot 9
+# Gantt chart
+st.altair_chart(
+    alt.Chart(
+        data=gantt_df.filter(pl.col("Type") == "Sleep")
+        .join(worst_days_df, on="Date", how="inner")
+        .with_columns(pl.col("Date").cast(pl.String)),
+    )
+    .mark_bar()
+    .encode(
+        x=alt.X(
+            "StartTime:T",
+            title="",
+            axis=alt.Axis(format="%H:%M"),
+        ),
+        x2="EndTime:T",
+        y=alt.Y("Date:O", title="", sort="y"),
+        color=alt.Color("Type", legend=alt.Legend(orient="top", title=None)),
+    )
+    .configure_axisY(
+        titleAngle=0,
+        titleY=-10,
+        titleX=-22,
+    ),
+    use_container_width=True,
+)
+
+st.write(worst_days_stat_df)
